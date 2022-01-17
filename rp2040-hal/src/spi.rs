@@ -4,18 +4,25 @@
 //!
 //! ## Usage
 //!
-//! ```rust
-//! let sio = Sio::new(p.SIO);
-//! let gpio_pins = Pins::new(p.IO_BANK0, p.PADS_BANK0, sio.gpio_bank0, &mut p.RESETS);
+//! ```no_run
+//! use embedded_hal::spi::MODE_0;
+//! use embedded_time::rate::*;
+//! use rp2040_hal::{spi::Spi, gpio::{Pins, FunctionSpi}, pac, Sio};
 //!
-//! let _ = gpio_pins.spi_sclk.into_mode::<FunctionSpi>();
-//! let _ = gpio_pins.spi_mosi.into_mode::<FunctionSpi>();
+//! let mut peripherals = pac::Peripherals::take().unwrap();
+//! let sio = Sio::new(peripherals.SIO);
+//! let pins = Pins::new(peripherals.IO_BANK0, peripherals.PADS_BANK0, sio.gpio_bank0, &mut peripherals.RESETS);
 //!
-//! let spi = Spi::<_, _, 8>::new(p.SPI0).init(&mut p.RESETS, 125_000_000.Hz(), 16_000_000.Hz(), &MODE_0);
+//! let _ = pins.gpio2.into_mode::<FunctionSpi>();
+//! let _ = pins.gpio3.into_mode::<FunctionSpi>();
+//!
+//! let spi = Spi::<_, _, 8>::new(peripherals.SPI0).init(&mut peripherals.RESETS, 125_000_000u32.Hz(), 16_000_000u32.Hz(), &MODE_0);
 //! ```
 
 use crate::resets::SubsystemReset;
 use core::{convert::Infallible, marker::PhantomData, ops::Deref};
+#[cfg(feature = "eh1_0_alpha")]
+use eh1_0_alpha::spi as eh1;
 use embedded_hal::blocking::spi;
 use embedded_hal::spi::{FullDuplex, Mode, Phase, Polarity};
 use embedded_time::rate::*;
@@ -67,20 +74,11 @@ impl<S: State, D: SpiDevice, const DS: u8> Spi<S, D, DS> {
     pub fn free(self) -> D {
         self.device
     }
-}
 
-impl<D: SpiDevice, const DS: u8> Spi<Disabled, D, DS> {
-    /// Create new spi device
-    pub fn new(device: D) -> Spi<Disabled, D, DS> {
-        Spi {
-            device,
-            state: PhantomData,
-        }
-    }
     /// Set baudrate based on peripheral clock
     ///
     /// Typically the peripheral clock is set to 125_000_000
-    fn set_baudrate<F: Into<Hertz<u32>>, B: Into<Hertz<u32>>>(
+    pub fn set_baudrate<F: Into<Hertz<u32>>, B: Into<Hertz<u32>>>(
         &mut self,
         peri_frequency: F,
         baudrate: B,
@@ -88,7 +86,7 @@ impl<D: SpiDevice, const DS: u8> Spi<Disabled, D, DS> {
         let freq_in = peri_frequency.into().integer();
         let baudrate = baudrate.into().integer();
         let mut prescale: u8 = u8::MAX;
-        let mut postdiv: u8 = 1;
+        let mut postdiv: u8 = 0;
 
         // Find smallest prescale value which puts output frequency in range of
         // post-divide. Prescale is an even number from 2 to 254 inclusive.
@@ -106,10 +104,10 @@ impl<D: SpiDevice, const DS: u8> Spi<Disabled, D, DS> {
         debug_assert_ne!(prescale, u8::MAX);
 
         // Find largest post-divide which makes output <= baudrate. Post-divide is
-        // an integer in the range 1 to 256 inclusive.
-        for postdiv_option in (1..=256u32).rev() {
-            if freq_in / (prescale as u32 * (postdiv_option - 1)) > baudrate {
-                postdiv = postdiv_option as u8;
+        // an integer in the range 0 to 255 inclusive.
+        for postdiv_option in (1..=255u8).rev() {
+            if freq_in / (prescale as u32 * postdiv_option as u32) > baudrate {
+                postdiv = postdiv_option;
                 break;
             }
         }
@@ -119,10 +117,20 @@ impl<D: SpiDevice, const DS: u8> Spi<Disabled, D, DS> {
             .write(|w| unsafe { w.cpsdvsr().bits(prescale) });
         self.device
             .sspcr0
-            .modify(|_, w| unsafe { w.scr().bits(postdiv - 1) });
+            .modify(|_, w| unsafe { w.scr().bits(postdiv) });
 
         // Return the frequency we were able to achieve
-        (freq_in / (prescale as u32 * postdiv as u32)).Hz()
+        (freq_in / (prescale as u32 * (1 + postdiv as u32))).Hz()
+    }
+}
+
+impl<D: SpiDevice, const DS: u8> Spi<Disabled, D, DS> {
+    /// Create new spi device
+    pub fn new(device: D) -> Spi<Disabled, D, DS> {
+        Spi {
+            device,
+            state: PhantomData,
+        }
     }
 
     /// Set format and datasize
@@ -178,6 +186,29 @@ impl<D: SpiDevice, const DS: u8> Spi<Enabled, D, DS> {
     }
 }
 
+/// Same as core::convert::Infallible, but implementing spi::Error
+///
+/// For eh 1.0.0-alpha.6, Infallible doesn't implement spi::Error,
+/// so use a locally defined type instead.
+/// This should be removed with the next release of e-h.
+/// (https://github.com/rust-embedded/embedded-hal/pull/328)
+#[cfg(feature = "eh1_0_alpha")]
+pub enum SpiInfallible {}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl core::fmt::Debug for SpiInfallible {
+    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {}
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl eh1::Error for SpiInfallible {
+    fn kind(&self) -> eh1::ErrorKind {
+        match *self {}
+    }
+}
+
 macro_rules! impl_write {
     ($type:ident, [$($nr:expr),+]) => {
 
@@ -210,6 +241,32 @@ macro_rules! impl_write {
         impl<D: SpiDevice> spi::write::Default<$type> for Spi<Enabled, D, $nr> {}
         impl<D: SpiDevice> spi::transfer::Default<$type> for Spi<Enabled, D, $nr> {}
         impl<D: SpiDevice> spi::write_iter::Default<$type> for Spi<Enabled, D, $nr> {}
+
+        #[cfg(feature = "eh1_0_alpha")]
+        impl<D: SpiDevice> eh1::nb::FullDuplex<$type> for Spi<Enabled, D, $nr> {
+            type Error = SpiInfallible;
+
+            fn read(&mut self) -> Result<$type, nb::Error<SpiInfallible>> {
+                if !self.is_readable() {
+                    return Err(nb::Error::WouldBlock);
+                }
+
+                Ok(self.device.sspdr.read().data().bits() as $type)
+            }
+            fn write(&mut self, word: $type) -> Result<(), nb::Error<SpiInfallible>> {
+                // Write to TX FIFO whilst ignoring RX, then clean up afterward. When RX
+                // is full, PL022 inhibits RX pushes, and sets a sticky flag on
+                // push-on-full, but continues shifting. Safe if SSPIMSC_RORIM is not set.
+                if !self.is_writable() {
+                    return Err(nb::Error::WouldBlock);
+                }
+
+                self.device
+                    .sspdr
+                    .write(|w| unsafe { w.data().bits(word as u16) });
+                Ok(())
+            }
+        }
 
     )+
 

@@ -1,6 +1,10 @@
 // Based heavily on and in some places copied from `atsamd-hal` gpio::v2
 use super::dynpin::{DynGroup, DynPinId};
-use super::{OutputDriveStrength, OutputSlewRate};
+use super::{
+    InputOverride, Interrupt, InterruptOverride, OutputDriveStrength, OutputEnableOverride,
+    OutputOverride, OutputSlewRate,
+};
+use crate::atomic_register_access::{write_bitmask_clear, write_bitmask_set};
 use crate::gpio::dynpin::{DynDisabled, DynFunction, DynInput, DynOutput, DynPinMode};
 use crate::pac;
 
@@ -42,6 +46,10 @@ impl From<DynPinMode> for ModeFields {
                     PullUp => {
                         fields.pue = true;
                     }
+                    BusKeep => {
+                        fields.pde = true;
+                        fields.pue = true;
+                    }
                 }
             }
             Input(config) => {
@@ -56,6 +64,10 @@ impl From<DynPinMode> for ModeFields {
                         fields.pde = true;
                     }
                     PullUp => {
+                        fields.pue = true;
+                    }
+                    BusKeep => {
+                        fields.pde = true;
                         fields.pue = true;
                     }
                 }
@@ -88,12 +100,22 @@ impl From<DynPinMode> for ModeFields {
                     UsbAux => 9,
                 };
                 fields.inen = true;
+                if func == I2C {
+                    fields.pue = true;
+                }
             }
         };
 
         fields
     }
 }
+
+/// # Safety
+///
+/// Users should only implement the [`id`] function. No default function
+/// implementations should be overridden. The implementing type must also have
+/// "control" over the corresponding pin ID, i.e. it must guarantee that each
+/// pin ID is a singleton
 pub(super) unsafe trait RegisterInterface {
     /// Provide a [`DynPinId`] identifying the set of registers controlled by
     /// this type.
@@ -239,6 +261,161 @@ pub(super) unsafe trait RegisterInterface {
             DynGroup::Bank0 => gpio_change_mode(num, mode),
             DynGroup::Qspi => qspi_change_mode(num, mode),
         }
+    }
+
+    /// Clear interrupt.
+    #[inline]
+    fn clear_interrupt(&self, interrupt: Interrupt) {
+        let num = self.id().num as usize;
+        unsafe {
+            let io = &(*pac::IO_BANK0::ptr());
+            // There are four bits for each GPIO pin (one for each enumerator
+            // in the `Interrupt` enum). There are therefore eight pins per
+            // 32-bit register, and four registers in total.
+            let bit_in_reg = num % 8 * 4 + interrupt as usize;
+            io.intr[num >> 3].write(|w| w.bits(1 << bit_in_reg));
+        }
+    }
+
+    /// Interrupt status.
+    #[inline]
+    fn interrupt_status(&self, interrupt: Interrupt) -> bool {
+        let num = self.id().num as usize;
+        unsafe {
+            let io = &(*pac::IO_BANK0::ptr());
+            let cpuid = *(pac::SIO::ptr() as *const u32);
+            // There are four bits for each GPIO pin (one for each enumerator
+            // in the `Interrupt` enum). There are therefore eight pins per
+            // 32-bit register, and four registers per CPU.
+            let bit_in_reg = ((num % 8) * 4) + (interrupt as usize);
+            if cpuid == 0 {
+                (io.proc0_ints[num >> 3].read().bits() & (1 << bit_in_reg)) != 0
+            } else {
+                (io.proc1_ints[num >> 3].read().bits() & (1 << bit_in_reg)) != 0
+            }
+        }
+    }
+
+    /// Is interrupt enabled.
+    #[inline]
+    fn is_interrupt_enabled(&self, interrupt: Interrupt) -> bool {
+        let num = self.id().num as usize;
+        unsafe {
+            let io = &(*pac::IO_BANK0::ptr());
+            let cpuid = *(pac::SIO::ptr() as *const u32);
+            // There are four bits for each GPIO pin (one for each enumerator
+            // in the `Interrupt` enum). There are therefore eight pins per
+            // 32-bit register, and four registers per CPU.
+            let bit_in_reg = num % 8 * 4 + interrupt as usize;
+            if cpuid == 0 {
+                (io.proc0_inte[num >> 3].read().bits() & (1 << bit_in_reg)) != 0
+            } else {
+                (io.proc1_inte[num >> 3].read().bits() & (1 << bit_in_reg)) != 0
+            }
+        }
+    }
+
+    /// Enable or disable interrupt.
+    #[inline]
+    fn set_interrupt_enabled(&self, interrupt: Interrupt, enabled: bool) {
+        let num = self.id().num as usize;
+        unsafe {
+            let cpuid = *(pac::SIO::ptr() as *const u32);
+            let io = &(*pac::IO_BANK0::ptr());
+            // There are four bits for each GPIO pin (one for each enumerator
+            // in the `Interrupt` enum). There are therefore eight pins per
+            // 32-bit register, and four registers per CPU.
+            let reg = if cpuid == 0 {
+                io.proc0_inte[num >> 3].as_ptr()
+            } else {
+                io.proc1_inte[num >> 3].as_ptr()
+            };
+            let bit_in_reg = num % 8 * 4 + interrupt as usize;
+            if enabled {
+                write_bitmask_set(reg, 1 << bit_in_reg);
+            } else {
+                write_bitmask_clear(reg, 1 << bit_in_reg);
+            }
+        }
+    }
+
+    /// Is interrupt forced.
+    #[inline]
+    fn is_interrupt_forced(&self, interrupt: Interrupt) -> bool {
+        let num = self.id().num as usize;
+        unsafe {
+            let cpuid = *(pac::SIO::ptr() as *const u32);
+            let io = &(*pac::IO_BANK0::ptr());
+            // There are four bits for each GPIO pin (one for each enumerator
+            // in the `Interrupt` enum). There are therefore eight pins per
+            // 32-bit register, and four registers per CPU.
+            let bit_in_reg = num % 8 * 4 + interrupt as usize;
+            if cpuid == 0 {
+                (io.proc0_intf[num >> 3].read().bits() & (1 << bit_in_reg)) != 0
+            } else {
+                (io.proc1_intf[num >> 3].read().bits() & (1 << bit_in_reg)) != 0
+            }
+        }
+    }
+
+    /// Force or release interrupt.
+    #[inline]
+    fn set_interrupt_forced(&self, interrupt: Interrupt, forced: bool) {
+        let num = self.id().num as usize;
+        unsafe {
+            let cpuid = *(pac::SIO::ptr() as *const u32);
+            let io = &(*pac::IO_BANK0::ptr());
+            // There are four bits for each GPIO pin (one for each enumerator
+            // in the `Interrupt` enum). There are therefore eight pins per
+            // 32-bit register, and four registers per CPU.
+            let reg = if cpuid == 0 {
+                io.proc0_intf[num >> 3].as_ptr()
+            } else {
+                io.proc1_intf[num >> 3].as_ptr()
+            };
+            let bit_in_reg = num % 8 * 4 + interrupt as usize;
+            if forced {
+                write_bitmask_set(reg, 1 << bit_in_reg);
+            } else {
+                write_bitmask_clear(reg, 1 << bit_in_reg);
+            }
+        }
+    }
+
+    /// Set the interrupt override.
+    #[inline]
+    fn set_interrupt_override(&self, override_value: InterruptOverride) {
+        let num = self.id().num as usize;
+        unsafe { &(*pac::IO_BANK0::ptr()) }.gpio[num]
+            .gpio_ctrl
+            .modify(|_, w| w.irqover().bits(override_value as u8));
+    }
+
+    /// Set the input override.
+    #[inline]
+    fn set_input_override(&self, override_value: InputOverride) {
+        let num = self.id().num as usize;
+        unsafe { &(*pac::IO_BANK0::ptr()) }.gpio[num]
+            .gpio_ctrl
+            .modify(|_, w| w.inover().bits(override_value as u8));
+    }
+
+    /// Set the output enable override.
+    #[inline]
+    fn set_output_enable_override(&self, override_value: OutputEnableOverride) {
+        let num = self.id().num as usize;
+        unsafe { &(*pac::IO_BANK0::ptr()) }.gpio[num]
+            .gpio_ctrl
+            .modify(|_, w| w.oeover().bits(override_value as u8));
+    }
+
+    /// Set the output override.
+    #[inline]
+    fn set_output_override(&self, override_value: OutputOverride) {
+        let num = self.id().num as usize;
+        unsafe { &(*pac::IO_BANK0::ptr()) }.gpio[num]
+            .gpio_ctrl
+            .modify(|_, w| w.outover().bits(override_value as u8));
     }
 }
 

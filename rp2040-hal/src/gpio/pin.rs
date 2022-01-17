@@ -6,8 +6,8 @@
 //! to track the state of pins at compile-time. To do so, it uses traits to
 //! represent [type classes] and types as instances of those type classes. For
 //! example, the trait [`InputConfig`] acts as a [type-level enum] of the
-//! available input configurations, and the types [`Floating`], [`PullDown`] and
-//! [`PullUp`] are its type-level variants.
+//! available input configurations, and the types [`Floating`], [`PullDown`],
+//! [`PullUp`] and [`BusKeep`] are its type-level variants.
 //!
 //! When applied as a trait bound, a type-level enum restricts type parameters
 //! to the corresponding variants. All of the traits in this module are closed,
@@ -36,21 +36,26 @@
 //! within the [`Pins`] struct can be moved out and used individually.
 //!
 //!
-//! ```
-//! let mut peripherals = Peripherals::take().unwrap();
+//! ```no_run
+//! # use rp2040_hal::{pac, gpio::Pins, sio::Sio};
+//! let mut peripherals = pac::Peripherals::take().unwrap();
 //! let sio = Sio::new(peripherals.SIO);
 //! let pins = Pins::new(peripherals.IO_BANK0,peripherals.PADS_BANK0,sio.gpio_bank0, &mut peripherals.RESETS);
 //! ```
 //!
 //! Pins can be converted between modes using several different methods.
 //!
-//! ```
+//! ```no_run
+//! # use rp2040_hal::{pac, gpio::{bank0::Gpio12, Pin, Pins, FloatingInput}, sio::Sio};
+//! # let mut peripherals = pac::Peripherals::take().unwrap();
+//! # let sio = Sio::new(peripherals.SIO);
+//! # let pins = Pins::new(peripherals.IO_BANK0,peripherals.PADS_BANK0,sio.gpio_bank0, &mut peripherals.RESETS);
 //! // Use one of the literal function names
 //! let gpio12 = pins.gpio12.into_floating_input();
 //! // Use a generic method and one of the `PinMode` variant types
-//! let gpio12 = pins.gpio12.into_mode::<FloatingInput>();
-//! // Specify the target type and use `From`/`Into`
-//! let gpio12: Pin<Gpio12, FloatingInput> = pins.gpio12.into();
+//! let gpio12 = gpio12.into_mode::<FloatingInput>();
+//! // Specify the target type and use `.into_mode()`
+//! let gpio12: Pin<Gpio12, FloatingInput> = gpio12.into_mode();
 //! ```
 //!
 //! # Embedded HAL traits
@@ -61,16 +66,16 @@
 //!
 //! For example, you can control the logic level of an `OutputPin` like so
 //!
-//! ```
-//! use rp2040_hal::pac::Peripherals;
-//! use rp2040_hak::gpio::v2::Pins;
+//! ```no_run
+//! use rp2040_hal::{pac, gpio::{bank0::Gpio12, Pin, Pins, PushPullOutput}, sio::Sio};
 //! use embedded_hal::digital::v2::OutputPin;
 //!
-//! let mut peripherals = Peripherals::take().unwrap();
+//! let mut peripherals = pac::Peripherals::take().unwrap();
 //! let sio = Sio::new(peripherals.SIO);
 //! let pins = Pins::new(peripherals.IO_BANK0,peripherals.PADS_BANK0,sio.gpio_bank0, &mut peripherals.RESETS);
 //!
-//! pins.gpio12.set_high();
+//! let mut pin12: Pin<Gpio12, PushPullOutput> = pins.gpio12.into_mode();
+//! pin12.set_high();
 //! ```
 //!
 //! # Type-level features
@@ -88,13 +93,18 @@
 //! [`OptionalKind`]: crate::typelevel#optionalkind-trait-pattern
 //! [`AnyKind`]: crate::typelevel#anykind-trait-pattern
 use super::dynpin::{DynDisabled, DynInput, DynOutput, DynPinId, DynPinMode};
-use super::{OutputDriveStrength, OutputSlewRate};
+use super::{
+    InputOverride, Interrupt, InterruptOverride, OutputDriveStrength, OutputEnableOverride,
+    OutputOverride, OutputSlewRate,
+};
 use crate::gpio::reg::RegisterInterface;
 use crate::typelevel::{Is, NoneT, Sealed};
 use core::convert::Infallible;
 use core::marker::PhantomData;
 
 use crate::gpio::dynpin::DynFunction;
+#[cfg(feature = "eh1_0_alpha")]
+use eh1_0_alpha::digital::blocking as eh1;
 use hal::digital::v2::{InputPin, OutputPin, StatefulOutputPin, ToggleableOutputPin};
 
 use core::mem::transmute;
@@ -118,10 +128,13 @@ pub enum Floating {}
 pub enum PullDown {}
 /// Type-level variant of both [`DisabledConfig`] and [`InputConfig`]
 pub enum PullUp {}
+/// Type-level variant of both [`DisabledConfig`] and [`InputConfig`]
+pub enum BusKeep {}
 
 impl Sealed for Floating {}
 impl Sealed for PullDown {}
 impl Sealed for PullUp {}
+impl Sealed for BusKeep {}
 
 impl DisabledConfig for Floating {
     const DYN: DynDisabled = DynDisabled::Floating;
@@ -132,11 +145,14 @@ impl DisabledConfig for PullDown {
 impl DisabledConfig for PullUp {
     const DYN: DynDisabled = DynDisabled::PullUp;
 }
+impl DisabledConfig for BusKeep {
+    const DYN: DynDisabled = DynDisabled::BusKeep;
+}
 
 /// Type-level variant of [`PinMode`] for disabled modes
 ///
-/// Type `C` is one of three configurations: [`Floating`], [`PullDown`] or
-/// [`PullUp`]
+/// Type `C` is one of four configurations: [`Floating`], [`PullDown`],
+/// [`PullUp`] or [`BusKeep`]
 pub struct Disabled<C: DisabledConfig> {
     cfg: PhantomData<C>,
 }
@@ -151,6 +167,9 @@ pub type PullDownDisabled = Disabled<PullDown>;
 
 /// Type-level variant of [`PinMode`] for pull-up disabled mode
 pub type PullUpDisabled = Disabled<PullUp>;
+
+/// Type-level variant of [`PinMode`] for bus keep disabled mode
+pub type BusKeepDisabled = Disabled<BusKeep>;
 
 impl<I: PinId, C: DisabledConfig> ValidPinMode<I> for Disabled<C> {}
 
@@ -173,11 +192,14 @@ impl InputConfig for PullDown {
 impl InputConfig for PullUp {
     const DYN: DynInput = DynInput::PullUp;
 }
+impl InputConfig for BusKeep {
+    const DYN: DynInput = DynInput::BusKeep;
+}
 
 /// Type-level variant of [`PinMode`] for input modes
 ///
-/// Type `C` is one of three input configurations: [`Floating`], [`PullDown`] or
-/// [`PullUp`]
+/// Type `C` is one of four input configurations: [`Floating`], [`PullDown`],
+/// [`PullUp`] or [`BusKeep`]
 pub struct Input<C: InputConfig> {
     cfg: PhantomData<C>,
 }
@@ -192,6 +214,9 @@ pub type PullDownInput = Input<PullDown>;
 
 /// Type-level variant of [`PinMode`] for pull-up input mode
 pub type PullUpInput = Input<PullUp>;
+
+/// Type-level variant of [`PinMode`] for bus keep input mode
+pub type BusKeepInput = Input<BusKeep>;
 
 impl<I: PinId, C: InputConfig> ValidPinMode<I> for Input<C> {}
 
@@ -234,7 +259,7 @@ impl<C: OutputConfig> Sealed for Output<C> {}
 pub type PushPullOutput = Output<PushPull>;
 
 /// Type-level variant of [`PinMode`] for readable push-pull output mode
-type ReadableOutput = Output<Readable>;
+pub type ReadableOutput = Output<Readable>;
 
 impl<I: PinId, C: OutputConfig> ValidPinMode<I> for Output<C> {}
 
@@ -282,7 +307,21 @@ macro_rules! function {
     };
 }
 
-function!(Spi, Xip, Uart, I2C, Pwm, Pio0, Pio1, Clock, UsbAux);
+function!(Spi, Xip, Uart, I2C, Pwm, Clock, UsbAux);
+
+impl Sealed for pac::PIO0 {}
+impl FunctionConfig for pac::PIO0 {
+    const DYN: DynFunction = DynFunction::Pio0;
+}
+/// Type-level variant of [`PinMode`] for alternate peripheral function `pac::PIO0`
+pub type FunctionPio0 = Function<pac::PIO0>;
+
+impl Sealed for pac::PIO1 {}
+impl FunctionConfig for pac::PIO1 {
+    const DYN: DynFunction = DynFunction::Pio1;
+}
+/// Type-level variant of [`PinMode`] for alternate peripheral function `pac::PIO1`
+pub type FunctionPio1 = Function<pac::PIO1>;
 
 //==============================================================================
 //  Pin modes
@@ -482,6 +521,12 @@ where
         self.into_mode()
     }
 
+    /// Configure the pin to operate as a bus keep input
+    #[inline]
+    pub fn into_bus_keep_input(self) -> Pin<I, BusKeepInput> {
+        self.into_mode()
+    }
+
     /// Configure the pin to operate as a push-pull output
     #[inline]
     pub fn into_push_pull_output(self) -> Pin<I, PushPullOutput> {
@@ -512,10 +557,70 @@ where
         self.regs.read_slew_rate()
     }
 
-    /// Set the slew rate for the pin
+    /// Set the slew rate for the pin.
     #[inline]
     pub fn set_slew_rate(&mut self, rate: OutputSlewRate) {
         self.regs.write_slew_rate(rate)
+    }
+
+    /// Clear interrupt.
+    #[inline]
+    pub fn clear_interrupt(&mut self, interrupt: Interrupt) {
+        self.regs.clear_interrupt(interrupt);
+    }
+
+    /// Interrupt status.
+    #[inline]
+    pub fn interrupt_status(&self, interrupt: Interrupt) -> bool {
+        self.regs.interrupt_status(interrupt)
+    }
+
+    /// Is interrupt enabled.
+    #[inline]
+    pub fn is_interrupt_enabled(&self, interrupt: Interrupt) -> bool {
+        self.regs.is_interrupt_enabled(interrupt)
+    }
+
+    /// Enable or disable interrupt.
+    #[inline]
+    pub fn set_interrupt_enabled(&self, interrupt: Interrupt, enabled: bool) {
+        self.regs.set_interrupt_enabled(interrupt, enabled);
+    }
+
+    /// Is interrupt forced.
+    #[inline]
+    pub fn is_interrupt_forced(&self, interrupt: Interrupt) -> bool {
+        self.regs.is_interrupt_forced(interrupt)
+    }
+
+    /// Force or release interrupt.
+    #[inline]
+    pub fn set_interrupt_forced(&self, interrupt: Interrupt, forced: bool) {
+        self.regs.set_interrupt_forced(interrupt, forced);
+    }
+
+    /// Set the interrupt override.
+    #[inline]
+    pub fn set_interrupt_override(&mut self, override_value: InterruptOverride) {
+        self.regs.set_interrupt_override(override_value);
+    }
+
+    /// Set the input override.
+    #[inline]
+    pub fn set_input_override(&mut self, override_value: InputOverride) {
+        self.regs.set_input_override(override_value);
+    }
+
+    /// Set the output enable override.
+    #[inline]
+    pub fn set_output_enable_override(&mut self, override_value: OutputEnableOverride) {
+        self.regs.set_output_enable_override(override_value);
+    }
+
+    /// Set the output override.
+    #[inline]
+    pub fn set_output_override(&mut self, override_value: OutputOverride) {
+        self.regs.set_output_override(override_value);
     }
 
     #[inline]
@@ -739,6 +844,88 @@ where
     }
 }
 
+#[cfg(feature = "eh1_0_alpha")]
+impl<I, C> eh1::OutputPin for Pin<I, Output<C>>
+where
+    I: PinId,
+    C: OutputConfig,
+{
+    type Error = Infallible;
+    #[inline]
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        self._set_high();
+        Ok(())
+    }
+    #[inline]
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        self._set_low();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl<I> eh1::InputPin for Pin<I, ReadableOutput>
+where
+    I: PinId,
+{
+    type Error = Infallible;
+    #[inline]
+    fn is_high(&self) -> Result<bool, Self::Error> {
+        Ok(self._is_high())
+    }
+    #[inline]
+    fn is_low(&self) -> Result<bool, Self::Error> {
+        Ok(self._is_low())
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl<I, C> eh1::InputPin for Pin<I, Input<C>>
+where
+    I: PinId,
+    C: InputConfig,
+{
+    type Error = Infallible;
+    #[inline]
+    fn is_high(&self) -> Result<bool, Self::Error> {
+        Ok(self._is_high())
+    }
+    #[inline]
+    fn is_low(&self) -> Result<bool, Self::Error> {
+        Ok(self._is_low())
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl<I, C> eh1::ToggleableOutputPin for Pin<I, Output<C>>
+where
+    I: PinId,
+    C: OutputConfig,
+{
+    type Error = Infallible;
+    #[inline]
+    fn toggle(&mut self) -> Result<(), Self::Error> {
+        self._toggle();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl<I, C> eh1::StatefulOutputPin for Pin<I, Output<C>>
+where
+    I: PinId,
+    C: OutputConfig,
+{
+    #[inline]
+    fn is_set_high(&self) -> Result<bool, Self::Error> {
+        Ok(self._is_set_high())
+    }
+    #[inline]
+    fn is_set_low(&self) -> Result<bool, Self::Error> {
+        Ok(self._is_set_low())
+    }
+}
+
 //==============================================================================
 //  Pin definitions
 //==============================================================================
@@ -760,7 +947,7 @@ macro_rules! gpio {
 
                 // FIXME: Somehow just import what we need
                 #[allow(unused_imports)]
-                use super::{PullDownDisabled,PullUpDisabled,FloatingDisabled};
+                use super::{PullDownDisabled,PullUpDisabled,FloatingDisabled,BusKeepDisabled};
 
                 use super::{Pin,PinId};
                 use crate::resets::SubsystemReset;
@@ -786,9 +973,13 @@ macro_rules! gpio {
                 impl Pins {
                     /// Take ownership of the PAC peripherals and SIO slice and split it into discrete [`Pin`]s
                     pub fn new(io : [<IO_ $Group:upper>], pads: [<PADS_ $Group:upper>], sio: [<SioGpio $Group>], reset : &mut pac::RESETS) -> Self {
+                        pads.reset_bring_down(reset);
+                        io.reset_bring_down(reset);
+
                         io.reset_bring_up(reset);
                         pads.reset_bring_up(reset);
-                            unsafe { Self {
+                        unsafe {
+                            Self {
                                 _io: io,
                                 _pads: pads,
                                 _sio: sio,
@@ -800,7 +991,7 @@ macro_rules! gpio {
                     }
                 }
 
-                $( impl<I: PinId + BankPinId> super::ValidPinMode<I> for super::Function<super::$Func> {} )+
+                $( impl<I: PinId + BankPinId> super::ValidPinMode<I> for super::[<Function $Func>] {} )+
             }
         }
     }
@@ -897,6 +1088,33 @@ macro_rules! bsp_pins {
             ///
             /// This type is intended to provide more meaningful names for the
             /// given pins.
+            ///
+            /// To enable specific functions of the pins you can use the
+            /// [rp2040_hal::gpio::pin::Pin::into_mode] function with
+            /// one of:
+            /// - [rp2040_hal::gpio::pin::FunctionI2C]
+            /// - [rp2040_hal::gpio::pin::FunctionPwm]
+            /// - [rp2040_hal::gpio::pin::FunctionSpi]
+            /// - [rp2040_hal::gpio::pin::FunctionXip]
+            /// - [rp2040_hal::gpio::pin::FunctionPio0]
+            /// - [rp2040_hal::gpio::pin::FunctionPio1]
+            /// - [rp2040_hal::gpio::pin::FunctionUart]
+            ///
+            /// like this:
+            ///```no_run
+            /// use rp2040_hal::{pac, gpio::{bank0::Gpio12, Pin, Pins, PushPullOutput}, sio::Sio};
+            ///
+            /// let mut peripherals = pac::Peripherals::take().unwrap();
+            /// let sio = Sio::new(peripherals.SIO);
+            /// let pins = Pins::new(peripherals.IO_BANK0,peripherals.PADS_BANK0,sio.gpio_bank0, &mut peripherals.RESETS);
+            ///
+            /// let _spi_sclk = pins.gpio2.into_mode::<rp2040_hal::gpio::FunctionSpi>();
+            /// let _spi_mosi = pins.gpio3.into_mode::<rp2040_hal::gpio::FunctionSpi>();
+            /// let _spi_miso = pins.gpio4.into_mode::<rp2040_hal::gpio::FunctionSpi>();
+            ///```
+            ///
+            /// **See also [rp2040_hal::gpio::pin] for more in depth information
+            /// about this**!
             pub struct Pins {
                 $(
                     $( #[$id_cfg] )*

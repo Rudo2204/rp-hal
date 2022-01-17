@@ -16,19 +16,30 @@
 //! Instances of [`DynPin`] cannot be created directly. Rather, they must be
 //! created from their type-level equivalents using [`From`]/[`Into`].
 //!
-//! ```
+//! ```no_run
 //! // Move a pin out of the Pins struct and convert to a DynPin
+//! # use rp2040_hal::{pac, gpio::{DynPin, bank0::Gpio12, Pins}, Sio};
+//! # let mut peripherals = pac::Peripherals::take().unwrap();
+//! # let sio = Sio::new(peripherals.SIO);
+//! # let pins = Pins::new(peripherals.IO_BANK0,peripherals.PADS_BANK0,sio.gpio_bank0, &mut peripherals.RESETS);
+//! # use rp2040_hal::gpio::DYN_FLOATING_INPUT;
 //! let gpio12: DynPin = pins.gpio12.into();
 //! ```
 //!
 //! Conversions between pin modes use a value-level version of the type-level
 //! API.
 //!
-//! ```
+//! ```no_run
+//! # use rp2040_hal::{pac, gpio::{DynPin, Pins}, Sio};
+//! # let mut peripherals = pac::Peripherals::take().unwrap();
+//! # let sio = Sio::new(peripherals.SIO);
+//! # let pins = Pins::new(peripherals.IO_BANK0,peripherals.PADS_BANK0,sio.gpio_bank0, &mut peripherals.RESETS);
+//! # use rp2040_hal::gpio::DYN_FLOATING_INPUT;
+//! # let mut gpio12: DynPin = pins.gpio12.into();
 //! // Use one of the literal function names
 //! gpio12.into_floating_input();
 //! // Use a method and a DynPinMode variant
-//! gpio12.into_mode(DYN_FLOATING_INPUT);
+//! gpio12.try_into_mode(DYN_FLOATING_INPUT).unwrap();
 //! ```
 //!
 //! Because the pin state cannot be tracked at compile-time, many [`DynPin`]
@@ -41,11 +52,16 @@
 //! compile-time. Use [`TryFrom`](core::convert::TryFrom)/
 //! [`TryInto`](core::convert::TryInto) for this conversion.
 //!
-//! ```
+//! ```no_run
+//! # use core::convert::TryInto;
+//! # use rp2040_hal::{pac, gpio::{DynPin, bank0::Gpio12, Pin, Pins, FloatingInput}, Sio};
+//! # let mut peripherals = pac::Peripherals::take().unwrap();
+//! # let sio = Sio::new(peripherals.SIO);
+//! # let pins = Pins::new(peripherals.IO_BANK0,peripherals.PADS_BANK0,sio.gpio_bank0, &mut peripherals.RESETS);
 //! // Convert to a `DynPin`
-//! let gpio12: DynPin = pins.gpio12.into();
+//! let mut gpio12: DynPin = pins.gpio12.into();
 //! // Change pin mode
-//! pa27.into_floating_input();
+//! gpio12.into_floating_input();
 //! // Convert back to a `Pin`
 //! let gpio12: Pin<Gpio12, FloatingInput> = gpio12.try_into().unwrap();
 //! ```
@@ -62,6 +78,8 @@ use super::pin::{Pin, PinId, PinMode, ValidPinMode};
 use super::reg::RegisterInterface;
 use core::convert::TryFrom;
 
+#[cfg(feature = "eh1_0_alpha")]
+use eh1_0_alpha::digital::blocking as eh1;
 use hal::digital::v2::{InputPin, OutputPin, StatefulOutputPin, ToggleableOutputPin};
 
 //==============================================================================
@@ -75,6 +93,7 @@ pub enum DynDisabled {
     Floating,
     PullDown,
     PullUp,
+    BusKeep,
 }
 
 /// Value-level `enum` for input configurations
@@ -84,6 +103,7 @@ pub enum DynInput {
     Floating,
     PullDown,
     PullUp,
+    BusKeep,
 }
 
 /// Value-level `enum` for output configurations
@@ -514,6 +534,53 @@ impl ToggleableOutputPin for DynPin {
 }
 
 impl StatefulOutputPin for DynPin {
+    #[inline]
+    fn is_set_high(&self) -> Result<bool, Self::Error> {
+        self._is_set_high()
+    }
+    #[inline]
+    fn is_set_low(&self) -> Result<bool, Self::Error> {
+        self._is_set_low()
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl eh1::OutputPin for DynPin {
+    type Error = Error;
+    #[inline]
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        self._set_high()
+    }
+    #[inline]
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        self._set_low()
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl eh1::InputPin for DynPin {
+    type Error = Error;
+    #[inline]
+    fn is_high(&self) -> Result<bool, Self::Error> {
+        self._is_high()
+    }
+    #[inline]
+    fn is_low(&self) -> Result<bool, Self::Error> {
+        self._is_low()
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl eh1::ToggleableOutputPin for DynPin {
+    type Error = Error;
+    #[inline]
+    fn toggle(&mut self) -> Result<(), Self::Error> {
+        self._toggle()
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl eh1::StatefulOutputPin for DynPin {
     #[inline]
     fn is_set_high(&self) -> Result<bool, Self::Error> {
         self._is_set_high()

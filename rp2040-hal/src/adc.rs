@@ -1,6 +1,41 @@
 //! Analog-Digital Converter (ADC)
-// See [Chapter 4 Section 9](https://datasheets.raspberrypi.org/rp2040/rp2040_datasheet.pdf) for more details
-// TODO
+//!
+//! See [Chapter 4 Section 9](https://datasheets.raspberrypi.org/rp2040/rp2040_datasheet.pdf) of the datasheet for more details
+//!
+//! ## Usage
+//!
+//! Capture ADC reading from a pin
+//! ```no_run
+//! use embedded_hal::adc::OneShot;
+//! use rp2040_hal::{adc::Adc, gpio::Pins, pac, Sio};
+//! let mut peripherals = pac::Peripherals::take().unwrap();
+//! let sio = Sio::new(peripherals.SIO);
+//! let pins = Pins::new(peripherals.IO_BANK0, peripherals.PADS_BANK0, sio.gpio_bank0, &mut peripherals.RESETS);
+//! // Enable adc
+//! let mut adc = Adc::new(peripherals.ADC, &mut peripherals.RESETS);
+//! // Configure one of the pins as an ADC input
+//! let mut adc_pin_0 = pins.gpio26.into_floating_input();
+//! // Read the ADC counts from the ADC channel
+//! let pin_adc_counts: u16 = adc.read(&mut adc_pin_0).unwrap();
+//! ```
+//!
+//! Capture ADC reading from temperature sensor. Note that this needs conversion to be a real-world temperature.
+//! ```no_run
+//! use embedded_hal::adc::OneShot;
+//! use rp2040_hal::{adc::Adc, gpio::Pins, pac, Sio};
+//! let mut peripherals = pac::Peripherals::take().unwrap();
+//! let sio = Sio::new(peripherals.SIO);
+//! let pins = Pins::new(peripherals.IO_BANK0, peripherals.PADS_BANK0, sio.gpio_bank0, &mut peripherals.RESETS);
+//! // Enable adc
+//! let mut adc = Adc::new(peripherals.ADC, &mut peripherals.RESETS);
+//! // Enable the temperature sensor
+//! let mut temperature_sensor = adc.enable_temp_sensor();
+//! // Read the ADC counts from the ADC channel
+//! let temperature_adc_counts: u16 = adc.read(&mut temperature_sensor).unwrap();
+//! ```
+//!
+//! See [examples/adc.rs](https://github.com/rp-rs/rp-hal/tree/main/rp2040-hal/examples/adc.rs) and
+//! [pimoroni_pico_explorer_showcase.rs](https://github.com/rp-rs/rp-hal/tree/main/boards/pimoroni_pico_explorer/examples/pimoroni_pico_explorer_showcase.rs) for more complete examples
 
 use hal::adc::{Channel, OneShot};
 use pac::{ADC, RESETS};
@@ -68,6 +103,15 @@ macro_rules! channel {
                 $channel
             }
         }
+
+        #[cfg(feature = "eh1_0_alpha")]
+        impl eh1_0_alpha::adc::nb::Channel<Adc> for Pin<$pin, FloatingInput> {
+            type ID = u8; // ADC channels are identified numerically
+
+            fn channel(&self) -> u8 {
+                $channel
+            }
+        }
     };
 }
 
@@ -89,6 +133,15 @@ impl Channel<Adc> for TempSense {
     }
 }
 
+#[cfg(feature = "eh1_0_alpha")]
+impl eh1_0_alpha::adc::nb::Channel<Adc> for TempSense {
+    type ID = u8; // ADC channels are identified numerically
+
+    fn channel(&self) -> u8 {
+        TEMPERATURE_SENSOR_CHANNEL
+    }
+}
+
 impl<WORD, PIN> OneShot<Adc, WORD, PIN> for Adc
 where
     WORD: From<u16>,
@@ -103,15 +156,48 @@ where
             self.device.cs.modify(|_, w| w.ts_en().set_bit())
         }
 
-        if self.device.cs.read().ready().bit_is_set() {
-            self.device
-                .cs
-                .modify(|_, w| unsafe { w.ainsel().bits(chan).start_once().set_bit() });
-        };
-        if !self.device.cs.read().ready().bit_is_set() {
-            // Can't return WouldBlock here since that would take to long and next call conversion would be over
+        while !self.device.cs.read().ready().bit_is_set() {
             cortex_m::asm::nop();
-        };
+        }
+
+        self.device
+            .cs
+            .modify(|_, w| unsafe { w.ainsel().bits(chan).start_once().set_bit() });
+
+        while !self.device.cs.read().ready().bit_is_set() {
+            cortex_m::asm::nop();
+        }
+
+        Ok(self.device.result.read().result().bits().into())
+    }
+}
+
+#[cfg(feature = "eh1_0_alpha")]
+impl<WORD, PIN> eh1_0_alpha::adc::nb::OneShot<Adc, WORD, PIN> for Adc
+where
+    WORD: From<u16>,
+    PIN: eh1_0_alpha::adc::nb::Channel<Adc, ID = u8>,
+{
+    type Error = ();
+
+    fn read(&mut self, pin: &mut PIN) -> nb::Result<WORD, Self::Error> {
+        let chan = PIN::channel(pin);
+
+        if chan == 4 {
+            self.device.cs.modify(|_, w| w.ts_en().set_bit())
+        }
+
+        while !self.device.cs.read().ready().bit_is_set() {
+            cortex_m::asm::nop();
+        }
+
+        self.device
+            .cs
+            .modify(|_, w| unsafe { w.ainsel().bits(chan).start_once().set_bit() });
+
+        while !self.device.cs.read().ready().bit_is_set() {
+            cortex_m::asm::nop();
+        }
 
         Ok(self.device.result.read().result().bits().into())
     }

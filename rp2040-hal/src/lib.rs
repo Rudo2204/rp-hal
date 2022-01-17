@@ -5,6 +5,8 @@
 
 #![warn(missing_docs)]
 #![no_std]
+#![cfg_attr(feature = "embassy-traits", feature(generic_associated_types))]
+#![cfg_attr(feature = "embassy-traits", feature(type_alias_impl_trait))]
 
 extern crate cortex_m;
 extern crate embedded_hal as hal;
@@ -14,9 +16,14 @@ pub use paste;
 pub extern crate rp2040_pac as pac;
 
 pub mod adc;
+pub(crate) mod atomic_register_access;
 pub mod clocks;
+mod critical_section_impl;
+pub mod dma;
 pub mod gpio;
 pub mod i2c;
+pub mod multicore;
+pub mod pio;
 pub mod pll;
 pub mod prelude;
 pub mod pwm;
@@ -33,3 +40,12 @@ pub mod uart;
 pub mod usb;
 pub mod watchdog;
 pub mod xosc;
+
+// Provide access to common datastructures to avoid repeating ourselves
+pub use adc::Adc;
+pub use clocks::Clock;
+pub use i2c::I2C;
+pub use sio::Sio;
+pub use spi::Spi;
+pub use timer::Timer;
+pub use watchdog::Watchdog;
